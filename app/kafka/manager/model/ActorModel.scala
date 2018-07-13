@@ -175,6 +175,9 @@ object ActorModel {
 
   sealed trait KARequest extends QueryRequest
   case class KAGetGroupSummary(groupList: Seq[String], enqueue: java.util.Queue[(String, kafka.coordinator.GroupSummary)]) extends QueryRequest
+  case class KAGetGroups(groups: scala.collection.mutable.TreeSet[String]) extends QueryRequest
+  case class KAGetConsumerOffset(groupTopicPartitionsMap: scala.collection.concurrent.TrieMap[String, Seq[TopicAndPartition]],
+      offsetMap: scala.collection.concurrent.TrieMap[(String, String, Int), kafka.common.OffsetAndMetadata]) extends QueryRequest
 
   case class TopicList(list: IndexedSeq[String], deleteSet: Set[String], clusterContext: ClusterContext) extends QueryResponse
   case class TopicConfig(topic: String, config: Option[(Int,String)]) extends QueryResponse

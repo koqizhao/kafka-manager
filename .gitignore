@@ -14,3 +14,9 @@ RUNNING_PID
 .DS_Store
 *.log
 *.swp
+.metadata
+.project
+.classpath
+RemoteSystemsTempFiles
+*un~
+/bin/
