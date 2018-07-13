@@ -45,6 +45,7 @@ import kafka.utils.ZKGroupTopicDirs
 import org.apache.kafka.common.security.JaasUtils
 import org.I0Itec.zkclient._
 import org.I0Itec.zkclient.exception._
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * @author hiral
@@ -102,14 +103,14 @@ case class KafkaAdminClientActor(config: KafkaAdminClientActorConfig) extends Ba
   }
 
   override def processQueryRequest(request: QueryRequest): Unit = {
-    if(adminClientOption.isEmpty) {
-      context.actorSelection(config.kafkaStateActorPath).tell(KSGetBrokers, self)
-      log.error(s"AdminClient not initialized yet, cannot process request : $request")
-    } else {
-      implicit val ec = longRunningExecutionContext
-      request match {
-        case KAGetGroupSummary(groupList: Seq[String], enqueue: java.util.Queue[(String, kafka.coordinator.GroupSummary)]) =>
-          Future {
+    implicit val ec = longRunningExecutionContext
+    request match {
+      case KAGetGroupSummary(groupList: Seq[String], enqueue: java.util.Queue[(String, kafka.coordinator.GroupSummary)]) =>
+        Future {
+          if(adminClientOption.isEmpty) {
+            context.actorSelection(config.kafkaStateActorPath).tell(KSGetBrokers, self)
+            log.error(s"AdminClient not initialized yet, cannot process request : $request")
+          } else {
             groupList.foreach {
               group =>
                 try {
@@ -129,9 +130,16 @@ case class KafkaAdminClientActor(config: KafkaAdminClientActorConfig) extends Ba
                 }
             }
           }
-        case KAGetGroups(groups: mutable.TreeSet[String]) =>
-          Future {
-            try {
+        }
+      case KAGetGroups(running: AtomicBoolean, groups: mutable.TreeSet[String]) =>
+        Future {
+          val start = System.currentTimeMillis()
+          try {
+            if(adminClientOption.isEmpty) {
+              context.actorSelection(config.kafkaStateActorPath).tell(KSGetBrokers, self)
+              log.error(s"AdminClient not initialized yet, cannot process request : $request")
+            } else {
+              log.info("groups fetch started")
               adminClientOption.foreach {
                 client =>
                   val groupOverviewList = client.listAllGroupsFlattened()
@@ -139,61 +147,69 @@ case class KafkaAdminClientActor(config: KafkaAdminClientActorConfig) extends Ba
                     groupOverviewList.foreach(groups += _.groupId)
                   }
               }
-            } catch {
-              case e: Exception =>
-                log.error(e, s"Forcing new admin client initialization...")
-                Try { adminClientOption.foreach(_.close()) }
-                adminClientOption = None
             }
+          } catch {
+            case e: Exception =>
+              log.error(e, s"Forcing new admin client initialization...")
+              Try { adminClientOption.foreach(_.close()) }
+              adminClientOption = None
+          } finally {
+            running.set(false)
+
+            val elipsed = System.currentTimeMillis() - start
+            val count = groups.size;
+            log.info(s"groups fetch eclipsed: $elipsed, fetched: $count")
           }
-        case KAGetConsumerOffset(groupTopicPartitionsMap: TrieMap[String, Seq[TopicAndPartition]], offsetMap: TrieMap[(String, String, Int), OffsetAndMetadata]) =>
-          Future {
-            try {
-              if (zkUtilsOption.isEmpty) {
-                zkUtilsOption = Option(createZkUtils())
-              }
-              zkUtilsOption.foreach {
-                zkUtils => {
-                  val start = System.currentTimeMillis()
-                  groupTopicPartitionsMap.foreach {
-                    case (group, topicPartitions) =>
-                      var channel : kafka.network.BlockingChannel = null
-                      try {
-                        channel = ClientUtils.channelToOffsetManager(group, zkUtils, 10 * 1000, 100)
-                        channel.send(OffsetFetchRequest(group, topicPartitions))
-                        val offsetFetchResponse = OffsetFetchResponse.readFrom(channel.receive().payload())
+        }
+      case KAGetConsumerOffset(running: AtomicBoolean, groupTopicPartitionsMap: TrieMap[String, Seq[TopicAndPartition]],
+          offsetMap: TrieMap[(String, String, Int), OffsetAndMetadata]) =>
+        Future {
+          val start = System.currentTimeMillis()
+          try {
+            log.info("groups offset fetch started")
+            if (zkUtilsOption.isEmpty) {
+              zkUtilsOption = Option(createZkUtils())
+            }
+            zkUtilsOption.foreach {
+              zkUtils => {
+                groupTopicPartitionsMap.foreach {
+                  case (group, topicPartitions) =>
+                    var channel : kafka.network.BlockingChannel = null
+                    try {
+                      channel = ClientUtils.channelToOffsetManager(group, zkUtils, 10 * 1000, 100)
+                      channel.send(OffsetFetchRequest(group, topicPartitions))
+                      val offsetFetchResponse = OffsetFetchResponse.readFrom(channel.receive().payload())
 
-                        offsetFetchResponse.requestInfo.foreach {
-                          case (topicAndPartition, offsetAndMetadata) =>
-                            if (offsetAndMetadata.error == ErrorMapping.NoError)
-                              offsetMap.put((group, topicAndPartition.topic, topicAndPartition.partition), OffsetAndMetadata(offsetAndMetadata.offset))
-                            else {
-                              println("Could not fetch offset for %s due to %s.".format(topicAndPartition, ErrorMapping.exceptionFor(offsetAndMetadata.error)))
-                              offsetMap.put((group, topicAndPartition.topic, topicAndPartition.partition), OffsetAndMetadata(-1))
-                            }
-                        }
-                      } finally {
-                        if (channel != null)
-                          channel.disconnect()
+                      offsetFetchResponse.requestInfo.foreach {
+                        case (topicAndPartition, offsetAndMetadata) =>
+                          if (offsetAndMetadata.error == ErrorMapping.NoError)
+                            offsetMap.put((group, topicAndPartition.topic, topicAndPartition.partition), OffsetAndMetadata(offsetAndMetadata.offset))
+                          else {
+                            println("Could not fetch offset for %s due to %s.".format(topicAndPartition, ErrorMapping.exceptionFor(offsetAndMetadata.error)))
+                            offsetMap.put((group, topicAndPartition.topic, topicAndPartition.partition), OffsetAndMetadata(-1))
+                          }
                       }
-                  }
-
-                  val elipsed = System.currentTimeMillis() - start
-                  log.info(s"missing consumerTopicPartitionOffsetMap fetch eclipsed: $elipsed")
-                  log.info(s"missing consumerTopicPartitionOffsetMap: $offsetMap")
+                    } finally {
+                      if (channel != null)
+                        channel.disconnect()
+                    }
                 }
               }
-            } catch {
-              case e: Exception =>
-                log.error(e, s"Forcing new ZkUtils initialization...")
-                Try { zkUtilsOption.foreach(_.close()) }
-                zkUtilsOption = None
             }
+          } catch {
+            case e: Exception =>
+              log.error(e, s"Forcing new ZkUtils initialization...")
+              Try { zkUtilsOption.foreach(_.close()) }
+              zkUtilsOption = None
+          } finally {
+            running.set(false)
+            val elipsed = System.currentTimeMillis() - start
+            val count = offsetMap.values.size
+            log.info(s"missing consumerTopicPartitionOffsetMap fetch eclipsed: $elipsed, fetched: $count")
           }
-        case any: Any => log.warning("kac : processQueryRequest : Received unknown message: {}", any.toString)
-      }
+        }
+      case any: Any => log.warning("kac : processQueryRequest : Received unknown message: {}", any.toString)
     }
-
   }
 
   override def processActorResponse(response: ActorResponse): Unit = {
@@ -216,15 +232,15 @@ class KafkaAdminClient(context: => ActorContext, adminClientActorPath: ActorPath
     }
   }
   
-  def updateGroups(groups: mutable.TreeSet[String]) : Unit = {
+  def updateGroups(running: AtomicBoolean, groups: mutable.TreeSet[String]) : Unit = {
     Try {
-      context.actorSelection(adminClientActorPath).tell(KAGetGroups(groups), ActorRef.noSender)
+      context.actorSelection(adminClientActorPath).tell(KAGetGroups(running, groups), ActorRef.noSender)
     }
   }
 
-  def updateConsumerOffset(groupTopicPartitionsMap: TrieMap[String, Seq[TopicAndPartition]], offsetMap: TrieMap[(String, String, Int), OffsetAndMetadata]) : Unit = {
+  def updateConsumerOffset(running: AtomicBoolean, groupTopicPartitionsMap: TrieMap[String, Seq[TopicAndPartition]], offsetMap: TrieMap[(String, String, Int), OffsetAndMetadata]) : Unit = {
     Try {
-      context.actorSelection(adminClientActorPath).tell(KAGetConsumerOffset(groupTopicPartitionsMap, offsetMap), ActorRef.noSender)
+      context.actorSelection(adminClientActorPath).tell(KAGetConsumerOffset(running, groupTopicPartitionsMap, offsetMap), ActorRef.noSender)
     }
   }
 }
@@ -255,6 +271,8 @@ case class KafkaManagedOffsetCache(clusterContext: ClusterContext
   @volatile
   var newestGroups = new mutable.TreeSet[String]()
   val missGroupTopicPartitionOffsetMap = new TrieMap[(String, String, Int), OffsetAndMetadata]()
+  val groupsFetchRunning = new AtomicBoolean()
+  val missGroupsOffsetFetchRunning = new AtomicBoolean()
 
   private[this] val queue = new ConcurrentLinkedDeque[(String, GroupSummary)]()
 
@@ -289,10 +307,16 @@ case class KafkaManagedOffsetCache(clusterContext: ClusterContext
   private[this] def performGroupMetadataCheck() : Unit = {
     val currentMillis = System.currentTimeMillis()
     if((lastGroupMemberMetadataCheckMillis + groupMemberMetadataCheckMillis) < currentMillis) {
-      groups = newestGroups
-      info(s"newestGroups: $groups")
-      newestGroups = new mutable.TreeSet[String]()
-      adminClient.updateGroups(newestGroups)
+      if (!groupsFetchRunning.get()) {
+        if (!newestGroups.isEmpty) {
+          groups = newestGroups
+          info(s"newestGroups: $groups")
+          newestGroups = new mutable.TreeSet[String]()
+        }
+        groupsFetchRunning.set(true)
+        info("groups fetch running")
+        adminClient.updateGroups(groupsFetchRunning, newestGroups)
+      }
 
       val diff = new mutable.TreeSet[String]()
       val diff1 = groupTopicPartitionOffsetMap.keySet.filterNot(groupTopicPartitionMemberMap.contains)
@@ -311,6 +335,7 @@ case class KafkaManagedOffsetCache(clusterContext: ClusterContext
       }
 
       if (diff2.nonEmpty) {
+        info(s"diff2Groups: $diff2")
         val groupTopicPartitionsMap = new TrieMap[String, Seq[TopicAndPartition]]()
         diff2.foreach {
           group =>
@@ -327,9 +352,10 @@ case class KafkaManagedOffsetCache(clusterContext: ClusterContext
             }
         }
         
-        if (!groupTopicPartitionsMap.isEmpty) {
+        if (!groupTopicPartitionsMap.isEmpty && !missGroupsOffsetFetchRunning.get()) {
           info(s"update missing group offset for $groupTopicPartitionsMap")
-          adminClient.updateConsumerOffset(groupTopicPartitionsMap, missGroupTopicPartitionOffsetMap)
+          missGroupsOffsetFetchRunning.set(true)
+          adminClient.updateConsumerOffset(missGroupsOffsetFetchRunning, groupTopicPartitionsMap, missGroupTopicPartitionOffsetMap)
         }
       }
       
@@ -410,9 +436,7 @@ case class KafkaManagedOffsetCache(clusterContext: ClusterContext
                 val record = iterator.next()
                 readMessageKey(ByteBuffer.wrap(record.key())) match {
                   case OffsetKey(version, key) =>
-                    warn(s"OffsetKey: $version, $key")
                     val value: OffsetAndMetadata = readOffsetMessageValue(ByteBuffer.wrap(record.value()))
-                    warn(s"OffsetAndMetadata: $value")
                     groupTopicPartitionOffsetMap += (key.group, key.topicPartition.topic, key.topicPartition.partition) -> value
                     val topic = key.topicPartition.topic
                     val group = key.group
@@ -438,9 +462,7 @@ case class KafkaManagedOffsetCache(clusterContext: ClusterContext
                     }
                     topicSet += topic
                   case GroupMetadataKey(version, key) =>
-                    warn(s"GroupMetadataKey: $version, $key")
                     val value: GroupMetadata = readGroupMessageValue(key, ByteBuffer.wrap(record.value()))
-                    warn(s"GroupMetadata: $value")
                     value.allMemberMetadata.foreach {
                       mm =>
                         mm.assignment.foreach {
@@ -761,11 +783,7 @@ trait OffsetCache extends Logging {
   final def getConsumerList: ConsumerList = {
     val kafkaConsumerList = getKafkaManagedConsumerList; 
     val zkConsumerList = getZKManagedConsumerList;
-    info("kafkaConsumerList: " + kafkaConsumerList)
-    info("zkConsumerList: " + zkConsumerList)
-    val cl = ConsumerList(kafkaConsumerList ++ zkConsumerList, clusterContext)
-    info("allList: " + cl.list)
-    cl
+    ConsumerList(kafkaConsumerList ++ zkConsumerList, clusterContext)
   }
 }
 
