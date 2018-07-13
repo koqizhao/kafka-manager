@@ -58,6 +58,7 @@ case class KafkaAdminClientActorConfig(clusterContext: ClusterContext, longRunni
 case class KafkaAdminClientActor(config: KafkaAdminClientActorConfig) extends BaseClusterQueryActor with LongRunningPoolActor {
 
   private[this] var adminClientOption : Option[AdminClient] = None
+  private[this] var adminClientOption2 : Option[AdminClient] = None
   private[this] var zkUtilsOption : Option[KZKUtils] = None
 
   protected implicit val clusterContext: ClusterContext = config.clusterContext
@@ -135,12 +136,12 @@ case class KafkaAdminClientActor(config: KafkaAdminClientActorConfig) extends Ba
         Future {
           val start = System.currentTimeMillis()
           try {
-            if(adminClientOption.isEmpty) {
+            if(adminClientOption2.isEmpty) {
               context.actorSelection(config.kafkaStateActorPath).tell(KSGetBrokers, self)
               log.error(s"AdminClient not initialized yet, cannot process request : $request")
             } else {
               log.info("groups fetch started")
-              adminClientOption.foreach {
+              adminClientOption2.foreach {
                 client =>
                   val groupOverviewList = client.listAllGroupsFlattened()
                   if(groupOverviewList != null) {
@@ -151,8 +152,8 @@ case class KafkaAdminClientActor(config: KafkaAdminClientActorConfig) extends Ba
           } catch {
             case e: Exception =>
               log.error(e, s"Forcing new admin client initialization...")
-              Try { adminClientOption.foreach(_.close()) }
-              adminClientOption = None
+              Try { adminClientOption2.foreach(_.close()) }
+              adminClientOption2 = None
           } finally {
             running.set(false)
 
@@ -217,7 +218,10 @@ case class KafkaAdminClientActor(config: KafkaAdminClientActorConfig) extends Ba
       case bl: BrokerList =>
         if(bl.list.nonEmpty) {
           Try {
-            adminClientOption = Option(createAdminClient(bl))
+            if (adminClientOption.isEmpty)
+              adminClientOption = Option(createAdminClient(bl))
+            if (adminClientOption2.isEmpty)
+              adminClientOption2 = Option(createAdminClient(bl))
           }.logError(s"Failed to create admin client with brokerlist : $bl")
         }
       case any: Any => log.warning("kac : processActorResponse : Received unknown message: {}", any.toString)
