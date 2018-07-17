@@ -138,9 +138,8 @@ case class KafkaAdminClientActor(config: KafkaAdminClientActorConfig) extends Ba
           try {
             if(adminClientOption2.isEmpty) {
               context.actorSelection(config.kafkaStateActorPath).tell(KSGetBrokers, self)
-              log.error(s"AdminClient not initialized yet, cannot process request : $request")
+              log.error(s"AdminClient2 not initialized yet, cannot process request : $request")
             } else {
-              log.info("groups fetch started")
               adminClientOption2.foreach {
                 client =>
                   val groupOverviewList = client.listAllGroupsFlattened()
@@ -151,7 +150,7 @@ case class KafkaAdminClientActor(config: KafkaAdminClientActorConfig) extends Ba
             }
           } catch {
             case e: Exception =>
-              log.error(e, s"Forcing new admin client initialization...")
+              log.error(e, s"Forcing new admin client 2 initialization...")
               Try { adminClientOption2.foreach(_.close()) }
               adminClientOption2 = None
           } finally {
@@ -167,7 +166,6 @@ case class KafkaAdminClientActor(config: KafkaAdminClientActorConfig) extends Ba
         Future {
           val start = System.currentTimeMillis()
           try {
-            log.info("groups offset fetch started")
             if (zkUtilsOption.isEmpty) {
               zkUtilsOption = Option(createZkUtils())
             }
@@ -314,11 +312,9 @@ case class KafkaManagedOffsetCache(clusterContext: ClusterContext
       if (!groupsFetchRunning.get()) {
         if (!newestGroups.isEmpty) {
           groups = newestGroups
-          info(s"newestGroups: $groups")
           newestGroups = new mutable.TreeSet[String]()
         }
         groupsFetchRunning.set(true)
-        info("groups fetch running")
         adminClient.updateGroups(groupsFetchRunning, newestGroups)
       }
 
@@ -330,7 +326,6 @@ case class KafkaManagedOffsetCache(clusterContext: ClusterContext
 
       val diff2 = groups.filterNot(g => groupTopicPartitionOffsetMap.keySet.count(_._1.equals(g)) > 0);
       diff2.foreach(diff.add)
-      info(s"diffGroups: $diff")
 
       if (diff.nonEmpty) {
         val groupsToBackfill = diff.toSeq
@@ -339,7 +334,7 @@ case class KafkaManagedOffsetCache(clusterContext: ClusterContext
       }
 
       if (diff2.nonEmpty) {
-        info(s"diff2Groups: $diff2")
+        info(s"missing consumer groups: $diff2")
         val groupTopicPartitionsMap = new TrieMap[String, Seq[TopicAndPartition]]()
         diff2.foreach {
           group =>
@@ -357,7 +352,6 @@ case class KafkaManagedOffsetCache(clusterContext: ClusterContext
         }
         
         if (!groupTopicPartitionsMap.isEmpty && !missGroupsOffsetFetchRunning.get()) {
-          info(s"update missing group offset for $groupTopicPartitionsMap")
           missGroupsOffsetFetchRunning.set(true)
           adminClient.updateConsumerOffset(missGroupsOffsetFetchRunning, groupTopicPartitionsMap, missGroupTopicPartitionOffsetMap)
         }
